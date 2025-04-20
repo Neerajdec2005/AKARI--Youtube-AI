@@ -1,8 +1,10 @@
 import { supabase } from '../../lib/supabase';
 import { getEmbedding } from '../../lib/embeddings';
 import { fetchTrendingVideos, fetchTrendingShorts } from '../../lib/youtube';
-import axios from 'axios';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 import dotenv from 'dotenv';
+import axios from 'axios';
+
 dotenv.config();
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
@@ -12,8 +14,8 @@ if (!GEMINI_API_KEY || !YOUTUBE_API_KEY) {
   throw new Error('Please set both GEMINI_API_KEY and YOUTUBE_API_KEY in your .env file.');
 }
 
-const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent';
 const YOUTUBE_API_URL = 'https://www.googleapis.com/youtube/v3/search';
+const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 
 async function searchYouTube(query, maxResults = 5) {
   const response = await axios.get(YOUTUBE_API_URL, {
@@ -28,46 +30,44 @@ async function searchYouTube(query, maxResults = 5) {
 
   return response.data.items.map(item => {
     const { title, description } = item.snippet;
-    return `Title: ${title}\nDescription: ${description}`;
+    return { title, description };
   });
 }
 
-async function getGeminiResponseFromSearch(query) {
-  const searchResults = await searchYouTube(query);
-  const prompt = `Based on the following YouTube search results:\n\n${'-'.repeat(40)}\n${searchResults.join('\n\n')}\n${'-'.repeat(40)}\n\nGenerate a creative, unique, and detailed video content idea for the query: \"${query}\".`;
-  return getGeminiResponse(prompt);
+function cleanGeminiText(text) {
+  return text
+    .replace(/[*#]/g, '') 
+    .split('\n')
+    .map(line => line.trimEnd()) 
+    .filter((line, idx, arr) => {
+      return line || (arr[idx + 1] && arr[idx + 1].trim());
+    })
+    .join('\n')
+    .trim();
 }
 
-function cleanGeminiText(text) {
-    return text
-      .split('\n') // preserve line breaks
-      .map(line => line.replace(/[*#]/g, '').trim()) // remove *, # from each line
-      .join('\n') // join lines back with newlines
-      .trim();
-  }
-  
 
 async function getGeminiResponse(prompt) {
-  const url = `${GEMINI_API_URL}?key=${GEMINI_API_KEY}`;
-  const data = {
-    contents: [
-      {
-        parts: [{ text: prompt }]
-      }
-    ]
-  };
+  const model = genAI.getGenerativeModel({ model: 'gemini-1.5-pro' });
+  const result = await model.generateContent({
+    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+  });
+  const rawText = result.response.text();
+  return cleanGeminiText(rawText);
+}
 
-  const headers = {
-    'Content-Type': 'application/json'
-  };
+async function getGeminiResponseStream(prompt, onWord) {
+  const model = genAI.getGenerativeModel({ model: 'gemini-1.5-pro' });
+  const result = await model.generateContentStream({
+    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+  });
 
-  try {
-    const response = await axios.post(url, data, { headers });
-    const rawText = response.data?.candidates?.[0]?.content?.parts?.[0]?.text || 'No response from Gemini.';
-    return cleanGeminiText(rawText);
-  } catch (error) {
-    console.error('Error fetching response from Gemini:', error);
-    throw error;
+  for await (const chunk of result.stream) {
+    const raw = chunk.text();
+    if (raw) {
+      const cleaned = cleanGeminiText(raw);
+      if (cleaned) onWord(cleaned);
+    }
   }
 }
 
@@ -90,49 +90,91 @@ export default async function handler(req, res) {
 
     const embedding = await getEmbedding(query);
 
-    const pastContext = memories?.length
+    const pastContext = memories.length
       ? memories.map(m => `User: ${m.query}\nAgent: ${m.response}`).join('\n')
       : 'No previous context available.';
 
-    let resultData = {};
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Transfer-Encoding', 'chunked');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.flushHeaders();
+
+    let fullResponse = '';
+    const onWord = word => {
+      fullResponse += word;
+      res.write(word);
+    };
 
     if (contextAction === 'trending') {
       const videos = await fetchTrendingVideos(query);
       const shorts = await fetchTrendingShorts(query);
-      resultData = {
-        trendingVideos: videos,
-        trendingShorts: shorts
+    
+      const allTitles = [...videos, ...shorts].map(v => v.title);
+    
+      const wordFreq = {};
+      allTitles.forEach(title => {
+        const words = title.toLowerCase().match(/\w+/g);
+        if (words) {
+          words.forEach(word => {
+            wordFreq[word] = (wordFreq[word] || 0) + 1;
+          });
+        }
+      });
+    
+      const stopWords = new Set([
+        'the', 'a', 'an', 'in', 'on', 'of', 'and', 'to', 'is', 'for', 
+        'with', 'this', 'that', 'by', 'from'
+      ]);
+    
+      const trendingTopics = Object.entries(wordFreq)
+        .filter(([word]) => !stopWords.has(word))
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 5)
+        .map(([word], idx) => `${idx + 1}. ${word.charAt(0).toUpperCase() + word.slice(1)}`);
+    
+      const trendingVideos = videos.map((v, i) => `${i + 1}. ${v.title}`);
+      const trendingShorts = shorts.map((s, i) => `${i + 1}. ${s.title}`);
+    
+      const trendingResponse = {
+        trendingTopics,
+        trendingVideos,
+        trendingShorts
       };
-    } else if (contextAction === 'script') {
-      const prompt = `Based on the following conversation context:\n\n${pastContext}\n\nGenerate a YouTube script structure including:\n- Introduction (0:00 - 0:45): Hook the viewer.\n- Section 1 (0:45 - 3:00): Topic Overview.\n- Section 2 (3:00 - 7:00): Detailed Explanation.\n- Section 3 (7:00 - 10:00): Case Studies/Examples.\n- Call to Action (10:00 - 10:30): Invite the viewer to engage.`;
-      resultData = await getGeminiResponse(prompt);
+    
+      res.end(JSON.stringify(trendingResponse, null, 2));
+      return;
+    }
+    
+
+    let prompt;
+    if (contextAction === 'script') {
+      prompt = `Generate a YouTube script structure for the topic "${query}" including:\n- Introduction (0:00 - 0:45): Hook the viewer.\n- Section 1 (0:45 - 3:00): Topic Overview.\n- Section 2 (3:00 - 7:00): Detailed Explanation.\n- Section 3 (7:00 - 10:00): Case Studies/Examples.\n- Call to Action (10:00 - 10:30): Invite the viewer to engage.`;
+      await getGeminiResponseStream(prompt, onWord);
     } else if (contextAction === 'research') {
-      const prompt = `Generate a structured research overview for the topic \"${query}\" including:\n- A concise topic overview.\n- Uniqueness analysis.\n- A list of suggested ideas.\n- Implementation methods with examples.`;
-      resultData = await getGeminiResponse(prompt);
+      prompt = `Generate a structured research overview for the topic "${query}" including:\n- A concise topic overview.\n- Uniqueness analysis.\n- A list of suggested ideas.\n- Implementation methods with examples.`;
+      await getGeminiResponseStream(prompt, onWord);
+    } else if (contextAction === 'research-paper') {
+      prompt = `Create a detailed research paper outline for the topic "${query}". The structure should include:\n\n- Abstract\n- Introduction\n- Literature Review\n- Proposed Methodology\n- Results and Discussion\n- Conclusion and Future Work\n- References\n\nEach section should have 3-4 bullet points summarizing the content it should contain.`;
+      await getGeminiResponseStream(prompt, onWord);
     } else if (contextAction === 'video-idea') {
-      resultData = await getGeminiResponseFromSearch(query);
+      const results = await searchYouTube(query);
+      const combinedPrompt = `Based on the following YouTube search results:\n\n${'-'.repeat(40)}\n${results.map(r => `Title: ${r.title}\nDescription: ${r.description}`).join('\n\n')}\n${'-'.repeat(40)}\n\nGenerate a creative, unique, and detailed video content idea for the query: "${query}".`;
+      const idea = await getGeminiResponse(combinedPrompt);
+      res.end(JSON.stringify({ idea }));
+      return;
     } else {
-      const prompt = `User asked: \"${query}\"\n\nConversation history:\n${pastContext}\n\nPlease provide a thoughtful and detailed response.`;
-      resultData = await getGeminiResponse(prompt);
+      prompt = `User asked: "${query}"\n\nConversation history:\n${pastContext}\n\nPlease provide a thoughtful and detailed response.`;
+      await getGeminiResponseStream(prompt, onWord);
     }
 
-    const { error: insertError } = await supabase
-      .from('memories')
-      .insert([
-        {
-          user_id: userId,
-          conversation_id: conversationId,
-          query,
-          response: typeof resultData === 'string' ? resultData : JSON.stringify(resultData, null, 2),
-          embedding
-        }
-      ]);
-
-    if (insertError) console.error('Insert error:', insertError);
-
-    return res.status(200).json({ response: resultData });
+    await supabase.from('memories').insert([{ user_id: userId, conversation_id: conversationId, query, response: fullResponse, embedding }]);
+    res.end();
   } catch (error) {
     console.error('Chat API error:', error);
-    return res.status(500).json({ error: 'Internal Server Error' });
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Internal Server Error' });
+    } else {
+      res.end();
+    }
   }
 }
