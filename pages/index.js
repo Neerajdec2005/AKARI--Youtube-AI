@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-
+//
 export default function Home() {
   const [mounted, setMounted] = useState(false);
   const [userId] = useState('user123');
@@ -12,6 +12,7 @@ export default function Home() {
 
   const [sidebarWidth, setSidebarWidth] = useState(250);
   const isResizing = useRef(false);
+  const messagesEndRef = useRef(null);
 
   useEffect(() => setMounted(true), []);
 
@@ -61,28 +62,61 @@ export default function Home() {
     fetchMemories();
   }, [userId, conversationId]);
 
+  useEffect(() => {
+    if (messagesEndRef.current) {
+      messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [messages]);
+
   const handleSubmit = async e => {
     e.preventDefault();
     if (!query.trim()) return;
     setLoading(true);
+
+    let accumulatedResponse = '';
+
     try {
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ userId, conversationId, query, contextAction })
       });
-      const data = await res.json();
-      if (res.ok) {
-        setMessages(prev => [
-          ...prev,
-          { query, response: data.response, created_at: new Date().toISOString() }
-        ]);
-      } else {
-        console.error('Error:', data.error);
+
+      if (!res.ok) {
+        const errorData = await res.json();
+        console.error('Error:', errorData.error);
+        setLoading(false);
+        return;
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let done = false;
+
+      setMessages(prev => [
+        ...prev,
+        { query, response: '', created_at: new Date().toISOString() }
+      ]);
+
+      while (!done) {
+        const { value, done: doneReading } = await reader.read();
+        done = doneReading;
+        if (value) {
+          const chunk = decoder.decode(value, { stream: true });
+          accumulatedResponse += chunk;
+
+          setMessages(prev => {
+            const newMessages = [...prev];
+            const lastMessage = newMessages[newMessages.length - 1];
+            lastMessage.response = accumulatedResponse;
+            return newMessages;
+          });
+        }
       }
     } catch (err) {
       console.error('Unexpected error:', err);
     }
+
     setLoading(false);
     setQuery('');
   };
@@ -123,37 +157,56 @@ export default function Home() {
   if (!mounted) return null;
 
   return (
-    <div style={{ fontFamily: 'sans-serif' }}>
+    <>
+    <style jsx global>{`
+      html, body {
+        background-color: #000;
+        margin: 0;
+        padding: 0;
+      }
+    `}</style>
+    <div style={{ fontFamily: 'sans-serif', height: '100vh', display: 'flex', overflow: 'hidden' , backgroundColor: 'black'}}>
       {/* Sidebar */}
       <div style={{
-        position: 'absolute',
-        left: 0,
-        top: 0,
-        bottom: 0,
         width: `${sidebarWidth}px`,
-        background: '#fff',
-        borderRight: '1px solid #ccc',
+        background: '#202123',
+        color: '#fff',
+        display: 'flex',
+        flexDirection: 'column',
         padding: '1rem',
-        overflowY: 'auto',
         boxSizing: 'border-box',
+        overflowY: 'auto',
         zIndex: 5
       }}>
-        <h2>AKARI (YoutubeAI)</h2>
+        <h2 style={{ margin: '0 0 1rem 0', fontFamily:"TimesNewRoman"}}>AKARI (YoutubeAI)</h2>
         <button
           onClick={handleNewChat}
-          style={{ marginBottom: '1rem', padding: '0.5rem 1rem', cursor: 'pointer' }}
+          style={{
+            marginBottom: '1rem',
+            padding: '0.5rem 1rem',
+            cursor: 'pointer',
+            backgroundColor: '#3e3f40',
+            border: 'none',
+            color: '#fff',
+            borderRadius: '4px',
+            fontWeight: 'bold'
+          }}
         >
-          New Chat
+          + New Chat
         </button>
         {chatList.length > 0 ? (
-          <ul style={{ listStyle: 'none', padding: 0 }}>
+          <ul style={{ listStyle: 'none', padding: 0, margin: 0, flexGrow: 1 }}>
             {chatList.map((chat, idx) => (
               <li
                 key={idx}
                 style={{
                   marginBottom: '0.5rem',
                   cursor: 'pointer',
-                  color: chat.conversation_id === conversationId ? 'blue' : 'black'
+                  padding: '0.5rem',
+                  borderRadius: '4px',
+                  backgroundColor: chat.conversation_id === conversationId ? '#444654' : 'transparent',
+                  color: chat.conversation_id === conversationId ? '#fff' : '#ccc',
+                  fontWeight: chat.conversation_id === conversationId ? 'bold' : 'normal'
                 }}
                 onClick={() => handleSelectChat(chat.conversation_id)}
               >
@@ -170,58 +223,73 @@ export default function Home() {
       <div
         onMouseDown={handleMouseDown}
         style={{
-          position: 'absolute',
-          left: `${sidebarWidth}px`,
-          top: 0,
-          bottom: 0,
           width: '5px',
           cursor: 'col-resize',
-          backgroundColor: '#ccc',
+          backgroundColor: '#444654',
           zIndex: 6
         }}
       />
 
       {/* Chat Canvas */}
-      <div style={{
-        position: 'fixed',
-        left: `${sidebarWidth + 5}px`,
-        top: 0,
-        right: 0,
-        bottom: 0,
-        display: 'flex',
-        flexDirection: 'column',
-        padding: '1rem',
-        backgroundColor: '#f4f4f4',
-        overflowX: 'hidden',
-        overflowY: 'hidden',
-        boxSizing: 'border-box'
-      }}>
+      {/* Chat Canvas */}
+<div style={{
+  width: '82%',
+  height: '100%',
+  display: 'flex',
+  flexDirection: 'column',
+  backgroundColor: '#343541',
+  color: '#fff',
+  padding: '1rem',
+  boxSizing: 'border-box',
+  overflow: 'hidden',
+  flexShrink: 0
+}}>
+  
+
         {/* Messages */}
         <div style={{
           flexGrow: 1,
           overflowY: 'auto',
-          background: '#fff',
-          padding: '1rem',
-          borderRadius: '8px',
-          boxShadow: '0 0 5px rgba(0,0,0,0.05)'
+          paddingRight: '1rem',
+          marginBottom: '1rem',
+          scrollbarWidth: 'thin',
+          scrollbarColor: '#888 transparent'
         }}>
           {messages.length > 0 ? (
             messages.map((msg, idx) => (
-              <div key={idx} style={{ marginBottom: '1rem' }}>
-                <p style={{ margin: 0, fontWeight: 'bold' }}>You: {msg.query}</p>
+              <div key={idx} style={{ marginBottom: '1rem', display: 'flex', flexDirection: 'column' }}>
                 <div style={{
-                  margin: '0.5rem 0',
-                  padding: '0.5rem',
-                  background: '#f5f5f5',
-                  borderRadius: '4px',
-                  maxHeight: '150px',
-                  overflowY: 'auto',
+                  alignSelf: 'flex-start',
+                  backgroundColor: '#444654',
+                  color: '#fff',
+                  padding: '0.75rem 1rem',
+                  borderRadius: '10px',
+                  maxWidth: '70%',
+                  whiteSpace: 'pre-wrap',
+                  wordWrap: 'break-word'
+                }}>
+                  <strong>You:</strong> {msg.query}
+                </div>
+                <div style={{
+                  alignSelf: 'flex-start',
+                  backgroundColor: '#202123',
+                  color: '#fff',
+                  padding: '0.75rem 1rem',
+                  borderRadius: '10px',
+                  marginTop: '0.25rem',
+                  maxWidth: '70%',
                   whiteSpace: 'pre-wrap',
                   wordWrap: 'break-word',
-                  overflowX: 'auto'
+                  border: '1px solid #555'
                 }}>
                   <strong>Akari:</strong>{' '}
-                  {typeof msg.response === 'object'
+                  {Array.isArray(msg.response) && msg.response.every(line => typeof line === 'string')
+                    ? msg.response.map((line, idx) => (
+                        <div key={idx} style={{ whiteSpace: 'pre-wrap', wordWrap: 'break-word', marginBottom: '0.25rem' }}>
+                          {line}
+                        </div>
+                      ))
+                    : typeof msg.response === 'object'
                     ? <pre style={{
                         margin: 0,
                         whiteSpace: 'pre-wrap',
@@ -230,48 +298,89 @@ export default function Home() {
                       }}>{JSON.stringify(msg.response, null, 2)}</pre>
                     : msg.response}
                 </div>
-                <hr />
               </div>
             ))
           ) : (
             <p>No messages in this chat yet.</p>
           )}
+          <div ref={messagesEndRef} />
         </div>
 
         {/* Input */}
         <form onSubmit={handleSubmit} style={{
-          marginTop: '1rem',
-          background: '#fff',
+          display: 'flex',
+          flexDirection: 'column',
+          background: '#40414f',
           padding: '1rem',
           borderRadius: '8px',
-          border: '1px solid #ccc',
-          boxShadow: '0 0 5px rgba(0,0,0,0.05)'
+          border: '1px solid #555',
+          boxShadow: '0 0 5px rgba(0,0,0,0.2)'
         }}>
-          <div style={{ marginBottom: '0.5rem' }}>
-            <label>
-              Action:&nbsp;
-              <select value={contextAction} onChange={(e) => setContextAction(e.target.value)}>
-                <option value="trending">Trending Topics</option>
-                <option value="research">Research Articles</option>
-                <option value="script">Script Improvement</option>
-                <option value="default">General Query</option>
-              </select>
-            </label>
-          </div>
+          <div style={{ marginBottom: '0.5rem', display: 'flex', gap: '0.5rem' }}>
+  {['trending', 'research', 'script', 'default'].map((option) => {
+    const labels = {
+      trending: 'Trending Topics',
+      research: 'Research Articles',
+      script: 'Script Improvement',
+      default: 'General Query',
+    };
+    const isSelected = contextAction === option;
+    return (
+      <button
+        key={option}
+        type="button"
+        onClick={() => setContextAction(option)}
+        style={{
+          padding: '0.5rem 1rem',
+          borderRadius: '20px',
+          border: isSelected ? '2px solid #10a37f' : '2px solid transparent',
+          backgroundColor: isSelected ? '#10a37f' : '#40414f',
+          color: isSelected ? '#fff' : '#ccc',
+          cursor: 'pointer',
+          fontWeight: isSelected ? 'bold' : 'normal',
+          flexGrow: 1,
+          transition: 'background-color 0.3s ease, border-color 0.3s ease',
+        }}
+      >
+        {labels[option]}
+      </button>
+    );
+  })}
+</div>
+
           <textarea
             placeholder="Enter your query..."
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             rows={3}
-            style={{ width: '100%', marginBottom: '5px' }}
+            style={{
+              width: '100%',
+              marginBottom: '0.5rem',
+              padding: '0.5rem',
+              borderRadius: '4px',
+              border: '1px solid #555',
+              backgroundColor: '#202123',
+              color: '#fff',
+              resize: 'vertical',
+              fontSize: '1rem',
+              fontFamily: 'inherit'
+            }}
             required
+            disabled={loading}
           />
           <button
             type="submit"
             disabled={loading}
             style={{
-              padding: '0.5rem 1rem',
-              cursor: 'pointer'
+              padding: '0.75rem 1rem',
+              cursor: loading ? 'not-allowed' : 'pointer',
+              backgroundColor: loading ? '#555' : '#10a37f',
+              border: 'none',
+              borderRadius: '4px',
+              color: '#fff',
+              fontWeight: 'bold',
+              fontSize: '1rem',
+              transition: 'background-color 0.3s ease'
             }}
           >
             {loading ? 'Processing...' : 'Send'}
@@ -279,5 +388,6 @@ export default function Home() {
         </form>
       </div>
     </div>
+    </>
   );
 }
